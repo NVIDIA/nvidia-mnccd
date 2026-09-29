@@ -1059,6 +1059,7 @@ dependencies = [
  "openssl",
  "prost",
  "protox",
+ "rustls-pki-types",
  "serde",
  "sha2",
  "thiserror",

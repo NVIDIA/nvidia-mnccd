@@ -89,6 +89,9 @@ version = "0.10"
 [dependencies.prost]
 version = "0.14"
 
+[dependencies.rustls-pki-types]
+version = "1"
+
 [dependencies.serde]
 version = "1.0"
 features = ["derive"]

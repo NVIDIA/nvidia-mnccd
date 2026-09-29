@@ -109,9 +109,27 @@ TLS material uses the **same directory** as `mnccd_config.toml` (see resolution 
 | `tls/server.crt` / `tls/server.key` | This node's gRPC server identity. |
 | `tls/client.crt` / `tls/client.key` | This node's gRPC client identity when dialing peers. |
 
-Server certificates must present a DNS SAN (or name) of `mnccd` — peer clients verify against that domain. Private keys should be mode `0600`.
+Server certificates must present a DNS SAN (or name) matching `[tls].server_name` (default `mnccd`) — peer clients verify against that domain. Private keys should be mode `0600`.
 
 `tls/ca-root.key` is **not** read by MNCCD at runtime; keep the CA private key offline and use it only when issuing node certificates.
+
+**Optional mTLS peer certificate checks**
+
+With `mtls`, two optional `[tls]` keys restrict which certificates signed by `tls/ca-root.crt` a node accepts from its peers. They apply on top of the `[cluster].node_ips` allowlist and are useful when one CA issues certificates for more than one MNCCD cluster. When omitted or empty, behavior is unchanged. Use the same values on every node.
+
+| Field | Meaning |
+| --- | --- |
+| `[tls].server_name` | DNS name that every peer's server certificate must present as a DNS SAN; clients verify it during the TLS handshake. Default `mnccd`. IP addresses and wildcards are rejected. |
+| `[tls].allowed_client_organizations` | Subject Organization (O) values accepted on peer client certificates. The server denies requests whose client certificate has none of them (exact, case-sensitive match). Default: no check. |
+
+Setting either key while `[tls].mode` is not `mtls` is a startup error. `--no-tls` turns them off along with TLS.
+
+```toml
+[tls]
+mode = "mtls"
+server_name = "group-a.example.com"
+allowed_client_organizations = ["example-group-a"]
+```
 
 The TOML file defines the gRPC listen port and the cluster membership:
 
@@ -125,6 +143,8 @@ The TOML file defines the gRPC listen port and the cluster membership:
 | `[tls].mode` | gRPC transport: `psk` (default), `mtls`, or `none`. All nodes must match. |
 | `[tls].psk_identity` | TLS-PSK identity. **Required** when mode is `psk`; must match on every node. |
 | `[tls].psk_key` | TLS-PSK secret. **Required** when mode is `psk`; must match on every node. |
+| `[tls].server_name` | Optional, `mtls` only. DNS SAN required on peer server certificates (default `mnccd`). |
+| `[tls].allowed_client_organizations` | Optional, `mtls` only. Subject Organization values accepted on peer client certificates (default: no check). |
 
 Example `mnccd_config.toml`:
 

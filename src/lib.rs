@@ -22,6 +22,8 @@
 //! Set `[tls].mode` in `mnccd_config.toml` to `none`, `mtls`, or `psk` (default).
 //! Call [`init_grpc_tls_mode`] once at startup (via [`resolve_grpc_tls_mode`]) before
 //! spawning servers or clients. `--no-tls` forces plain mode on the CLI.
+//! In `mtls` mode, the optional `[tls].server_name` and `[tls].allowed_client_organizations`
+//! keys add peer certificate checks.
 //!
 //! # Service management
 //!
@@ -58,6 +60,7 @@ use std::{
     sync::{LazyLock, Mutex, OnceLock},
 };
 use thiserror::Error;
+use tonic::service::Interceptor;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
@@ -69,6 +72,7 @@ mod crypto;
 pub mod libnvml_sys;
 mod mnccd_grpc;
 mod node_allowlist;
+mod peer_cert_policy;
 mod psk_tls;
 mod utils;
 
@@ -184,6 +188,12 @@ struct RawTls {
     /// Required when `mode = "psk"`; empty/omitted is rejected at load for PSK mode.
     #[serde(default)]
     psk_key: String,
+    /// Optional, `mtls` only: DNS name peer server certificates must present (default `mnccd`).
+    #[serde(default)]
+    server_name: String,
+    /// Optional, `mtls` only: Subject Organization values accepted on peer client certificates.
+    #[serde(default)]
+    allowed_client_organizations: Vec<String>,
 }
 
 impl Default for RawTls {
@@ -192,6 +202,8 @@ impl Default for RawTls {
             mode: default_tls_mode(),
             psk_identity: String::new(),
             psk_key: String::new(),
+            server_name: String::new(),
+            allowed_client_organizations: Vec::new(),
         }
     }
 }
@@ -239,6 +251,9 @@ pub struct Config {
     pub grpc_tls_mode: GrpcTlsMode,
     /// PSK credentials when `grpc_tls_mode` is [`GrpcTlsMode::Psk`]; `None` for `mtls` / `none`.
     pub(crate) psk_tls: Option<psk_tls::PskTlsConfig>,
+    /// Optional mTLS peer certificate checks from `[tls].server_name` and
+    /// `[tls].allowed_client_organizations`; the default turns both off.
+    pub(crate) peer_cert_policy: peer_cert_policy::PeerCertPolicy,
 }
 
 /// Local GPU observed in RM recovery state for NVLE/link retrain handling.
@@ -324,6 +339,11 @@ fn load_config_fallible() -> Result<Config, String> {
     } else {
         None
     };
+    let peer_cert_policy = peer_cert_policy::PeerCertPolicy::from_config(
+        &raw.tls.server_name,
+        &raw.tls.allowed_client_organizations,
+    )?;
+    peer_cert_policy.ensure_supported(grpc_tls_mode)?;
     Ok(Config {
         server_port: raw.server.server_port,
         leader_ip,
@@ -333,6 +353,7 @@ fn load_config_fallible() -> Result<Config, String> {
         max_backoff_ms: raw.retry_policy.max_backoff_ms,
         grpc_tls_mode,
         psk_tls,
+        peer_cert_policy,
     })
 }
 
@@ -504,6 +525,21 @@ pub fn start_daemon() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Server-side checks for every gRPC request: the optional mTLS client Organization
+/// check, then the `node_ips` allowlist.
+fn server_interceptor(
+    mut client_organization: Option<peer_cert_policy::ClientOrganizationInterceptor>,
+    mut node_allowlist: node_allowlist::NodeAllowlistInterceptor,
+) -> impl Interceptor + Clone + Send + Sync + 'static {
+    move |request: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+        let request = match client_organization.as_mut() {
+            Some(check) => check.call(request)?,
+            None => request,
+        };
+        node_allowlist.call(request)
+    }
+}
+
 /// Spawns the local gRPC server on this node's primary IP and [`CONFIG`] port.
 ///
 /// Transport is selected by [`init_grpc_tls_mode`] (plain, mutual TLS, or TLS-PSK).
@@ -551,6 +587,10 @@ pub async fn spawn_and_start_server(
 
     let interceptor = node_allowlist::NodeAllowlistInterceptor::from_node_ips(&CONFIG.node_ips)
         .map_err(|e| format!("failed to build node IP allowlist: {e}"))?;
+    let interceptor = server_interceptor(
+        CONFIG.peer_cert_policy.client_organization_interceptor(tls_mode),
+        interceptor,
+    );
 
     let t1 = tokio::spawn(async move {
         let global_data = MnccdGlobalData::new();
@@ -723,7 +763,7 @@ async fn build_client_channel(
             let client_identity = Identity::from_pem(client_cert, client_key);
 
             let tls = ClientTlsConfig::new()
-                .domain_name("mnccd")
+                .domain_name(CONFIG.peer_cert_policy.server_name())
                 .ca_certificate(server_root_ca_cert)
                 .identity(client_identity);
 
@@ -2340,5 +2380,26 @@ max_backoff_ms = 1
                 "expected {invalid:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn peer_cert_fields_default_empty_when_tls_section_omitted() {
+        let raw: RawConfig = toml::from_str(MIN_CONFIG).unwrap();
+        assert!(raw.tls.server_name.is_empty());
+        assert!(raw.tls.allowed_client_organizations.is_empty());
+    }
+
+    #[test]
+    fn peer_cert_fields_parse_from_tls_section() {
+        let raw: RawConfig = toml::from_str(&format!(
+            "{MIN_CONFIG}\n[tls]\nmode = \"mtls\"\nserver_name = \"group-a.example.com\"\n\
+             allowed_client_organizations = [\"example-group-a\", \"example-group-b\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(raw.tls.server_name, "group-a.example.com");
+        assert_eq!(
+            raw.tls.allowed_client_organizations,
+            ["example-group-a", "example-group-b"]
+        );
     }
 }
