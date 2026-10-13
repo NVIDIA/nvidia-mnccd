@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(e);
     }
 
-    if let Err(e) = nvidia_mnccd::init_config() {
+    if let Err(e) = nvidia_mnccd::init_config(cli.no_tls) {
         error!("failed to load configuration: {e}");
         return Err(e.into());
     }
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _instance_lock = nvidia_mnccd::acquire_instance_lock()?;
     }
 
-    let tls_mode = nvidia_mnccd::resolve_grpc_tls_mode(cli.no_tls)?;
+    let tls_mode = nvidia_mnccd::CONFIG.grpc_tls_mode;
     nvidia_mnccd::warn_if_plaintext_grpc(tls_mode);
     nvidia_mnccd::init_grpc_tls_mode(tls_mode);
 

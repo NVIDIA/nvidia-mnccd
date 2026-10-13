@@ -127,14 +127,14 @@ mod tests {
         // source IP and is enumerated first) plus a bridge NIC, selection must
         // pick the bridge NIC because it is the one listed in node_ips — not the
         // default-route NIC.
-        let node_ips = vec!["10.0.0.1".to_string()];
+        let node_ips = vec!["10.0.1.1".to_string()];
         let interfaces = ifaces(&[
-            ("eth0", "10.0.0.1"),  // NAT NIC / default-route source IP
+            ("eth0", "10.0.0.1"), // NAT NIC / default-route source IP
             ("eth1", "10.0.1.1"), // bridge NIC advertised in node_ips
         ]);
 
         let selected = select_matching_ip(&node_ips, &interfaces).unwrap();
-        assert_eq!(selected, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(selected, "10.0.1.1".parse::<IpAddr>().unwrap());
         assert!(selected.is_ipv4());
     }
 

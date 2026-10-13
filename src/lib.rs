@@ -20,8 +20,9 @@
 //! # TLS
 //!
 //! Set `[tls].mode` in `mnccd_config.toml` to `none`, `mtls`, or `psk` (default).
-//! Call [`init_grpc_tls_mode`] once at startup (via [`resolve_grpc_tls_mode`]) before
-//! spawning servers or clients. `--no-tls` forces plain mode on the CLI.
+//! `--no-tls` overrides that to plaintext and skips unused `[tls]` PSK credentials.
+//! `tls.mode` is still validated. Call [`init_grpc_tls_mode`] once at startup before
+//! spawning servers or clients.
 //!
 //! # Service management
 //!
@@ -31,6 +32,11 @@
 //! Only one MNCCD instance may run on a host; see [`acquire_instance_lock`].
 //! Because that lock lives under `/run/nvidia-mnccd`, foreground runs require root;
 //! non-root users must pass `--daemonize`, which locks a PID file under `/tmp`.
+//!
+//! # Link retrain recovery
+//!
+//! Every node polls RM for the `DRAIN_P2P` recovery action once per second
+//! and reports it to the leader, which reruns the key programming sequence.
 //!
 //! # Logging
 //!
@@ -235,7 +241,7 @@ pub struct Config {
     pub initial_backoff_ms: u64,
     /// Upper bound on gRPC retry backoff delay, in milliseconds.
     pub max_backoff_ms: u64,
-    /// gRPC TLS mode from `[tls].mode` in config (before `--no-tls` override).
+    /// Effective gRPC TLS mode: `[tls].mode`, or plaintext when `--no-tls` was set.
     pub grpc_tls_mode: GrpcTlsMode,
     /// PSK credentials when `grpc_tls_mode` is [`GrpcTlsMode::Psk`]; `None` for `mtls` / `none`.
     pub(crate) psk_tls: Option<psk_tls::PskTlsConfig>,
@@ -308,14 +314,15 @@ fn parse_grpc_tls_mode(mode: &str) -> Result<GrpcTlsMode, String> {
     }
 }
 
-fn load_config_fallible() -> Result<Config, String> {
-    let dir_path = mnccd_config_dir();
-    let file_content = std::fs::read_to_string(dir_path.join("mnccd_config.toml"))
-        .map_err(|e| format!("failed to read mnccd_config.toml: {e}"))?;
-    let raw: RawConfig = toml::from_str(&file_content)
-        .map_err(|e| format!("failed to deserialize mnccd_config.toml: {e}"))?;
+fn config_from_raw(raw: RawConfig, no_tls: bool) -> Result<Config, String> {
     let leader_ip = leader_ip_from_node_ips(&raw.cluster.node_ips)?;
-    let grpc_tls_mode = parse_grpc_tls_mode(&raw.tls.mode)?;
+    let configured_grpc_tls_mode = parse_grpc_tls_mode(&raw.tls.mode)?;
+    let grpc_tls_mode = if no_tls {
+        GrpcTlsMode::Plain
+    } else {
+        configured_grpc_tls_mode
+    };
+    // `--no-tls` skips unused PSK credentials; tls.mode is still validated above.
     let psk_tls = if grpc_tls_mode == GrpcTlsMode::Psk {
         Some(psk_tls::PskTlsConfig::from_strings(
             &raw.tls.psk_identity,
@@ -336,17 +343,28 @@ fn load_config_fallible() -> Result<Config, String> {
     })
 }
 
+fn load_config_fallible(no_tls: bool) -> Result<Config, String> {
+    let dir_path = mnccd_config_dir();
+    let file_content = std::fs::read_to_string(dir_path.join("mnccd_config.toml"))
+        .map_err(|e| format!("failed to read mnccd_config.toml: {e}"))?;
+    let raw: RawConfig = toml::from_str(&file_content)
+        .map_err(|e| format!("failed to deserialize mnccd_config.toml: {e}"))?;
+    config_from_raw(raw, no_tls)
+}
+
 static CONFIG_CELL: OnceLock<Config> = OnceLock::new();
 
 /// Loads `mnccd_config.toml` once. Call from process startup before using [`CONFIG`].
 ///
-/// Returns a descriptive error for operator-fixable problems (missing file, invalid
-/// TOML, empty PSK credentials when `tls.mode = "psk"`, etc.) instead of panicking.
-pub fn init_config() -> Result<(), String> {
+/// `no_tls` is the `--no-tls` CLI flag: it forces plaintext gRPC and skips `[tls]` PSK
+/// credential checks. `tls.mode` is still validated. Returns a descriptive error for
+/// operator-fixable problems (missing file, invalid TOML, unknown `tls.mode`, empty PSK
+/// credentials when `tls.mode = "psk"` and `--no-tls` is not set, etc.) instead of panicking.
+pub fn init_config(no_tls: bool) -> Result<(), String> {
     if CONFIG_CELL.get().is_some() {
         return Ok(());
     }
-    let config = load_config_fallible()?;
+    let config = load_config_fallible(no_tls)?;
     // A concurrent first call may have won the race; either way config is loaded.
     let _ = CONFIG_CELL.set(config);
     Ok(())
@@ -381,6 +399,7 @@ static NVLE_SETUP_CONTEXT: LazyLock<Mutex<Option<NvleSetupContext>>> =
 const NVLE_KEY_SIZE_BYTES: usize = 32;
 const NVLE_KEY_REFRESH_BUSY_MAX_ATTEMPTS: usize = 120;
 const NVLE_KEY_REFRESH_BUSY_RETRY_DELAY_MS: u64 = 500;
+const NVLE_DRAIN_SETTLE_MS: u64 = 5_000;
 
 #[derive(Clone)]
 struct NvleSetupContext {
@@ -404,14 +423,6 @@ fn get_cached_nvle_setup_context() -> Result<NvleSetupContext, String> {
         "NVLE setup context is unavailable; initial NVLE setup must complete before key refresh"
             .to_string()
     })
-}
-
-/// Resolves the active gRPC TLS mode from config and CLI (`--no-tls` forces plain).
-pub fn resolve_grpc_tls_mode(no_tls_cli: bool) -> Result<GrpcTlsMode, String> {
-    if no_tls_cli {
-        return Ok(GrpcTlsMode::Plain);
-    }
-    Ok(CONFIG.grpc_tls_mode)
 }
 
 /// Warn when gRPC will run without TLS (`tls.mode = "none"` or `--no-tls`).
@@ -927,6 +938,8 @@ struct NvleKeySetupJob {
     local_gpu_nvle_private_info: Vec<u8>,
     remote_gpu_nvle_private_info: Vec<u8>,
     nvle_key: Vec<u8>,
+    /// Set when this write succeeds during programming, to skip it on busy retries.
+    programmed: bool,
 }
 
 #[derive(Clone)]
@@ -968,72 +981,164 @@ async fn setup_nvle_encryption_key_rpc_once(
     Ok(response.into_inner())
 }
 
-async fn program_nvle_key_refresh_jobs(
-    mut pending_pairs: Vec<NvleKeySetupPair>,
+/// Locates one key-setup job per GPU, for the drain phase to use as a DRAIN_P2P poke.
+///
+/// This should be used with the refresh jobs set, so if a key update is accepted
+/// there won't be a mismatch in key material.
+fn index_one_job_per_gpu(pairs: &[NvleKeySetupPair]) -> HashMap<&str, &NvleKeySetupJob> {
+    let mut by_uuid = HashMap::new();
+    for pair in pairs {
+        for job in [&pair.local, &pair.remote] {
+            by_uuid.entry(job.device_uuid.as_str()).or_insert(job);
+        }
+    }
+    by_uuid
+}
+
+/// Applies one key-write outcome to `job`, returning whether RM asked us to retry.
+///
+/// Marking the job programmed here prevents repeat writes during programming retries.
+fn apply_key_write_result(
+    job: &mut NvleKeySetupJob,
+    result: Result<mnccd_grpc::proto::MnccdGrpcSetupNvleEncryptionKeyResponse, tonic::Status>,
+) -> Result<bool, String> {
+    match result {
+        Ok(inner) if inner.success => {
+            job.programmed = true;
+            Ok(false)
+        }
+        Ok(inner) if nvle_key_setup_response_is_busy(&inner) => Ok(true),
+        Ok(inner) => Err(key_setup_job_error(job, inner.error_message)),
+        Err(e) => Err(key_setup_job_error(job, e)),
+    }
+}
+
+/// Solicits each GPU not already draining once, waits for RM to settle, then verifies
+/// every GPU reports DRAIN_P2P.
+async fn drive_all_gpus_into_drain_p2p(
+    channel_map: &HashMap<String, Channel>,
+    all_gpu_uuids: &HashSet<String>,
+    pairs: &[NvleKeySetupPair],
 ) -> Result<(), String> {
+    let drained = collect_drain_p2p_recovery_gpu_uuids_from_all_nodes(channel_map).await?;
+    let pending = sorted_set_difference(all_gpu_uuids, &drained);
+    let poke_index = index_one_job_per_gpu(pairs);
+    // Serialize pokes per node, running different nodes in parallel.
+    let mut by_node: HashMap<&str, Vec<&NvleKeySetupJob>> = HashMap::new();
+    for uuid in pending {
+        let &job = poke_index
+            .get(uuid.as_str())
+            .ok_or_else(|| format!("No drain poke job for expected GPU {uuid}"))?;
+        info!(
+            "GPU {} (node {}) not in DRAIN_P2P yet; sending key update to trigger drain",
+            job.device_uuid, job.node_ip
+        );
+        by_node
+            .entry(job.node_ip.as_str())
+            .or_default()
+            .push(job);
+    }
+
+    let node_tasks = by_node.into_values().map(|jobs| async move {
+        for job in jobs {
+            let device_uuid = job.device_uuid.clone();
+            let node_ip = job.node_ip.clone();
+            // Verify actual state below even if a poke failed or its response was lost.
+            match setup_nvle_encryption_key_rpc_once(job.clone()).await {
+                Ok(inner) if inner.success => {
+                    debug!(
+                        "Drain poke for {device_uuid} (node {node_ip}) was accepted; programming will reuse the same key material"
+                    );
+                }
+                Ok(inner) if nvle_key_setup_response_is_busy(&inner) => debug!(
+                    "Drain poke for {device_uuid} (node {node_ip}) rejected as busy, as expected"
+                ),
+                Ok(inner) => warn!(
+                    "Drain poke for {device_uuid} (node {node_ip}) failed: {}",
+                    inner.error_message
+                ),
+                Err(e) => warn!("Drain poke for {device_uuid} (node {node_ip}) failed: {e}"),
+            }
+        }
+    });
+
+    join_all(node_tasks).await;
+
+    info!("Quiescing for {NVLE_DRAIN_SETTLE_MS} ms before verifying DRAIN_P2P state...");
+    tokio::time::sleep(std::time::Duration::from_millis(NVLE_DRAIN_SETTLE_MS)).await;
+
+    let drained = collect_drain_p2p_recovery_gpu_uuids_from_all_nodes(channel_map).await?;
+    let pending = sorted_set_difference(all_gpu_uuids, &drained);
+    if !pending.is_empty() {
+        return Err(format!(
+            "Drain verification failed: {} GPU(s) not in DRAIN_P2P: {}",
+            pending.len(),
+            pending.join(", ")
+        ));
+    }
+    info!("All {} GPU(s) are in DRAIN_P2P", all_gpu_uuids.len());
+    Ok(())
+}
+
+/// Programs every outstanding key write, retrying while RM reports busy.
+///
+/// Tracks successful writes so busy retries only revisit outstanding keys.
+async fn program_nvle_key_refresh_jobs(pairs: &mut [NvleKeySetupPair]) -> Result<(), String> {
     let mut busy_attempts = 0usize;
 
-    while !pending_pairs.is_empty() {
-        let mut still_busy = Vec::new();
+    loop {
+        let mut any_busy = false;
 
-        for pair in pending_pairs.into_iter() {
-            let (local_result, remote_result) = if pair.same_node {
-                // Same-node pair: serialize to avoid concurrent NVML calls on the host.
-                let local_result = setup_nvle_encryption_key_rpc_once(pair.local.clone()).await;
-                let remote_result = setup_nvle_encryption_key_rpc_once(pair.remote.clone()).await;
-                (local_result, remote_result)
-            } else {
+        for pair in pairs.iter_mut() {
+            // Skip writes RM has already accepted during this programming phase.
+            let local_pending = !pair.local.programmed;
+            let remote_pending = !pair.remote.programmed;
+
+            if local_pending && remote_pending && !pair.same_node {
                 // Cross-node pair: the RPCs land on different hosts, so run them concurrently.
-                tokio::join!(
+                let (local_result, remote_result) = tokio::join!(
                     setup_nvle_encryption_key_rpc_once(pair.local.clone()),
                     setup_nvle_encryption_key_rpc_once(pair.remote.clone()),
-                )
-            };
-
-            let local_busy = match local_result {
-                Ok(inner) if inner.success => false,
-                Ok(inner) if nvle_key_setup_response_is_busy(&inner) => true,
-                Ok(inner) => return Err(key_setup_job_error(&pair.local, inner.error_message)),
-                Err(e) => return Err(key_setup_job_error(&pair.local, e)),
-            };
-
-            let remote_busy = match remote_result {
-                Ok(inner) if inner.success => false,
-                Ok(inner) if nvle_key_setup_response_is_busy(&inner) => true,
-                Ok(inner) => return Err(key_setup_job_error(&pair.remote, inner.error_message)),
-                Err(e) => return Err(key_setup_job_error(&pair.remote, e)),
-            };
-
-            if local_busy || remote_busy {
-                still_busy.push(pair);
+                );
+                any_busy |= apply_key_write_result(&mut pair.local, local_result)?;
+                any_busy |= apply_key_write_result(&mut pair.remote, remote_result)?;
+            } else {
+                // Same-node pair, or only one side left: issue serially so a single node
+                // never sees concurrent NVML calls.
+                if local_pending {
+                    let result = setup_nvle_encryption_key_rpc_once(pair.local.clone()).await;
+                    any_busy |= apply_key_write_result(&mut pair.local, result)?;
+                }
+                if remote_pending {
+                    let result = setup_nvle_encryption_key_rpc_once(pair.remote.clone()).await;
+                    any_busy |= apply_key_write_result(&mut pair.remote, result)?;
+                }
             }
         }
 
-        if still_busy.is_empty() {
+        if !any_busy {
             return Ok(());
         }
 
+        let outstanding: Vec<String> = pairs
+            .iter()
+            .flat_map(|pair| [&pair.local, &pair.remote])
+            .filter(|job| !job.programmed)
+            .map(|job| format!("{} (node {})", job.device_uuid, job.node_ip))
+            .collect();
+
         busy_attempts += 1;
         if busy_attempts >= NVLE_KEY_REFRESH_BUSY_MAX_ATTEMPTS {
-            let uuids = still_busy
-                .iter()
-                .flat_map(|pair| {
-                    [
-                        format!("{} (node {})", pair.local.device_uuid, pair.local.node_ip),
-                        format!("{} (node {})", pair.remote.device_uuid, pair.remote.node_ip),
-                    ]
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
             return Err(format!(
                 "Timed out waiting for NVLE key refresh to leave NVML_ERROR_IN_USE after {} attempts: {}",
-                NVLE_KEY_REFRESH_BUSY_MAX_ATTEMPTS, uuids
+                NVLE_KEY_REFRESH_BUSY_MAX_ATTEMPTS,
+                outstanding.join(", ")
             ));
         }
 
         warn!(
-            "{} NVLE key refresh GPU pair(s) still busy; retrying attempt {} of {}",
-            still_busy.len(),
+            "{} NVLE key write(s) still busy; retrying attempt {} of {}",
+            outstanding.len(),
             busy_attempts + 1,
             NVLE_KEY_REFRESH_BUSY_MAX_ATTEMPTS
         );
@@ -1041,10 +1146,7 @@ async fn program_nvle_key_refresh_jobs(
             NVLE_KEY_REFRESH_BUSY_RETRY_DELAY_MS,
         ))
         .await;
-        pending_pairs = still_busy;
     }
-
-    Ok(())
 }
 
 async fn create_channel_map_for_configured_nodes() -> Result<HashMap<String, Channel>, String> {
@@ -1332,6 +1434,7 @@ fn build_nvle_key_setup_jobs(
                 local_gpu_nvle_private_info: local_gpu.nvle_private_info.clone(),
                 remote_gpu_nvle_private_info: remote_gpu.nvle_private_info.clone(),
                 nvle_key: key_secret.clone(),
+                programmed: false,
             };
             let remote_job = NvleKeySetupJob {
                 channel: remote_channel,
@@ -1342,6 +1445,7 @@ fn build_nvle_key_setup_jobs(
                 local_gpu_nvle_private_info: remote_gpu.nvle_private_info.clone(),
                 remote_gpu_nvle_private_info: local_gpu.nvle_private_info.clone(),
                 nvle_key: key_secret,
+                programmed: false,
             };
             jobs.push(NvleKeySetupPair {
                 local: local_job,
@@ -1597,6 +1701,9 @@ async fn set_nvle_ready_on_all_nodes(
 ///
 /// If another caller handled the event while this call was waiting for the
 /// refresh lock, this returns success without re-triggering DRAIN_P2P.
+/// Recovery failures never restore NVLE ready to true: an earlier attempt or an
+/// unacknowledged write may have left mismatched keys. Only a completed refresh
+/// enables NVLE ready again.
 pub async fn refresh_nvle_keys_for_drain_p2p_event(
     trigger_gpu_uuids: Vec<String>,
 ) -> Result<(), String> {
@@ -1647,7 +1754,7 @@ pub async fn refresh_nvle_keys_for_drain_p2p_event(
         ));
     }
 
-    let refresh_jobs = build_nvle_key_setup_jobs(
+    let mut refresh_jobs = build_nvle_key_setup_jobs(
         &setup_context.gpu_infos,
         &setup_context.uuid_to_alid,
         &channel_map,
@@ -1662,31 +1769,14 @@ pub async fn refresh_nvle_keys_for_drain_p2p_event(
         &setup_context.gpu_infos,
         false,
         "Refresh",
-        Some(true),
+        None,
     )
     .await?;
 
+    drive_all_gpus_into_drain_p2p(&channel_map, &cached_gpu_uuids, &refresh_jobs).await?;
+
     info!("Refreshing encryption keys for all GPU pairs; retrying while RM reports busy...");
-    if let Err(refresh_error) = program_nvle_key_refresh_jobs(refresh_jobs).await {
-        warn!(
-            "NVLE key refresh failed after ready=false; attempting to restore NVLE ready state to true"
-        );
-        if let Err(restore_error) = set_nvle_ready_on_all_nodes(
-            &channel_map,
-            &setup_context.gpu_infos,
-            true,
-            "Refresh restore",
-            None,
-        )
-        .await
-        {
-            return Err(format!(
-                "NVLE key refresh failed: {}; additionally failed to restore NVLE ready state to true: {}",
-                refresh_error, restore_error
-            ));
-        }
-        return Err(refresh_error);
-    }
+    program_nvle_key_refresh_jobs(&mut refresh_jobs).await?;
 
     set_nvle_ready_on_all_nodes(
         &channel_map,
@@ -2101,6 +2191,124 @@ mod nvle_setup_context_tests {
 }
 
 #[cfg(test)]
+mod drain_poke_job_tests {
+    use super::{
+        apply_key_write_result, index_one_job_per_gpu, sorted_set_difference, NvleKeySetupJob,
+        NvleKeySetupPair,
+    };
+    use std::collections::HashSet;
+    use tonic::transport::Channel;
+
+    /// Give each fixture GPU a distinct ALID, as the real ALID map does, so jobs for
+    /// different pairs are distinguishable.
+    fn alid_of(uuid: &str) -> u32 {
+        uuid.rsplit('-')
+            .next()
+            .and_then(|suffix| suffix.parse().ok())
+            .expect("fixture UUIDs end in a number")
+    }
+
+    fn job(uuid: &str, node_ip: &str, peer_uuid: &str) -> NvleKeySetupJob {
+        NvleKeySetupJob {
+            channel: Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            device_uuid: uuid.to_string(),
+            node_ip: node_ip.to_string(),
+            local_gpu_alid: alid_of(uuid),
+            remote_gpu_alid: alid_of(peer_uuid),
+            local_gpu_nvle_private_info: Vec::new(),
+            remote_gpu_nvle_private_info: Vec::new(),
+            nvle_key: vec![0u8; 32],
+            programmed: false,
+        }
+    }
+
+    fn pair(a: &str, a_node: &str, b: &str, b_node: &str) -> NvleKeySetupPair {
+        NvleKeySetupPair {
+            local: job(a, a_node, b),
+            remote: job(b, b_node, a),
+            same_node: a_node == b_node,
+        }
+    }
+
+    /// Full mesh over three GPUs, so each GPU appears in two pairs.
+    fn mesh() -> Vec<NvleKeySetupPair> {
+        vec![
+            pair("GPU-0", "10.0.0.1", "GPU-1", "10.0.0.1"),
+            pair("GPU-0", "10.0.0.1", "GPU-2", "10.0.0.2"),
+            pair("GPU-1", "10.0.0.1", "GPU-2", "10.0.0.2"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn indexes_exactly_one_job_per_gpu() {
+        let pairs = mesh();
+        let index = index_one_job_per_gpu(&pairs);
+
+        assert_eq!(index.len(), 3);
+        for uuid in ["GPU-0", "GPU-1", "GPU-2"] {
+            assert_eq!(index[uuid].device_uuid, uuid);
+        }
+        assert_eq!(index["GPU-2"].node_ip, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn poke_reuses_the_programming_jobs_key_material() {
+        let mut pairs = mesh();
+        pairs[1].remote.nvle_key = vec![42; 32];
+        pairs[1].remote.local_gpu_nvle_private_info = vec![1, 2];
+        pairs[1].remote.remote_gpu_nvle_private_info = vec![3, 4];
+        let index = index_one_job_per_gpu(&pairs);
+        let poke = index["GPU-2"];
+
+        assert!(std::ptr::eq(poke, &pairs[1].remote));
+        let request_job = poke.clone();
+        assert_eq!(request_job.nvle_key, pairs[1].remote.nvle_key);
+        assert_eq!(request_job.local_gpu_alid, pairs[1].remote.local_gpu_alid);
+        assert_eq!(request_job.remote_gpu_alid, pairs[1].remote.remote_gpu_alid);
+        assert_eq!(
+            request_job.local_gpu_nvle_private_info,
+            pairs[1].remote.local_gpu_nvle_private_info
+        );
+        assert_eq!(
+            request_job.remote_gpu_nvle_private_info,
+            pairs[1].remote.remote_gpu_nvle_private_info
+        );
+        assert!(pairs.iter().all(|pair| !pair.local.programmed && !pair.remote.programmed));
+    }
+
+    #[test]
+    fn drain_barrier_requires_every_expected_uuid() {
+        let expected = HashSet::from(["GPU-0".to_string(), "GPU-1".to_string()]);
+        let mut drained = HashSet::from(["GPU-0".to_string(), "GPU-unexpected".to_string()]);
+        assert_eq!(sorted_set_difference(&expected, &drained), vec!["GPU-1"]);
+        drained.insert("GPU-1".to_string());
+        assert!(sorted_set_difference(&expected, &drained).is_empty());
+    }
+
+    #[tokio::test]
+    async fn programming_records_only_successful_writes() {
+        use super::mnccd_grpc::proto::MnccdGrpcSetupNvleEncryptionKeyResponse;
+        let mut pairs = mesh();
+        let busy = MnccdGrpcSetupNvleEncryptionKeyResponse {
+            success: false,
+            retryable: true,
+            error_message: "busy".to_string(),
+        };
+        assert!(apply_key_write_result(&mut pairs[0].local, Ok(busy)).unwrap());
+        assert!(!pairs[0].local.programmed);
+
+        let success = MnccdGrpcSetupNvleEncryptionKeyResponse {
+            success: true,
+            retryable: false,
+            error_message: String::new(),
+        };
+        assert!(!apply_key_write_result(&mut pairs[0].local, Ok(success)).unwrap());
+        assert!(pairs[0].local.programmed);
+        assert!(!pairs[0].remote.programmed);
+    }
+}
+
+#[cfg(test)]
 mod logging_filter_tests {
     use super::{Level, CRATE_NAME};
     use tracing_subscriber::filter::EnvFilter;
@@ -2136,10 +2344,7 @@ mod endpoint_url_tests {
 
     #[test]
     fn ipv4_host_unchanged() {
-        assert_eq!(
-            format_host_for_uri_authority("10.0.0.1"),
-            "10.0.0.1"
-        );
+        assert_eq!(format_host_for_uri_authority("10.0.0.1"), "10.0.0.1");
     }
 
     #[test]
@@ -2340,5 +2545,105 @@ max_backoff_ms = 1
                 "expected {invalid:?} to be rejected"
             );
         }
+    }
+
+    fn tls_section(mode: &str) -> String {
+        if mode.eq_ignore_ascii_case("psk") {
+            format!(
+                "{MIN_CONFIG}\n[tls]\nmode = \"{mode}\"\npsk_identity = \"mnccd-cluster\"\npsk_key = \"unit-test-psk-key\"\n"
+            )
+        } else {
+            format!("{MIN_CONFIG}\n[tls]\nmode = \"{mode}\"\n")
+        }
+    }
+
+    #[test]
+    fn operator_can_select_none_psk_or_mtls() {
+        let cases = [
+            ("none", super::GrpcTlsMode::Plain),
+            ("psk", super::GrpcTlsMode::Psk),
+            ("mtls", super::GrpcTlsMode::Mtls),
+            ("NONE", super::GrpcTlsMode::Plain),
+            ("PSK", super::GrpcTlsMode::Psk),
+            ("MTLS", super::GrpcTlsMode::Mtls),
+        ];
+        for (mode, expected) in cases {
+            let raw: RawConfig = toml::from_str(&tls_section(mode)).unwrap();
+            let cfg = super::config_from_raw(raw, false)
+                .unwrap_or_else(|e| panic!("tls.mode = {mode:?} should load: {e}"));
+            assert_eq!(
+                cfg.grpc_tls_mode, expected,
+                "tls.mode = {mode:?} without --no-tls"
+            );
+            if expected == super::GrpcTlsMode::Psk {
+                assert!(cfg.psk_tls.is_some());
+            } else {
+                assert!(cfg.psk_tls.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn no_tls_forces_plain_regardless_of_config_mode() {
+        for mode in ["none", "psk", "mtls", "NONE", "PSK", "MTLS"] {
+            let raw: RawConfig = toml::from_str(&tls_section(mode)).unwrap();
+            let cfg = super::config_from_raw(raw, true)
+                .unwrap_or_else(|e| panic!("--no-tls should load when tls.mode = {mode:?}: {e}"));
+            assert_eq!(
+                cfg.grpc_tls_mode,
+                super::GrpcTlsMode::Plain,
+                "--no-tls with tls.mode = {mode:?}"
+            );
+            assert!(
+                cfg.psk_tls.is_none(),
+                "--no-tls should not keep PSK material"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_tls_mode_rejected_even_with_no_tls() {
+        let raw: RawConfig = toml::from_str(&tls_section("not-a-mode")).unwrap();
+        let err_without = super::config_from_raw(raw, false).unwrap_err();
+        assert!(
+            err_without.contains("invalid tls.mode"),
+            "garbage tls.mode without --no-tls should fail, got: {err_without}"
+        );
+
+        let raw: RawConfig = toml::from_str(&tls_section("not-a-mode")).unwrap();
+        let err_with = super::config_from_raw(raw, true).unwrap_err();
+        assert!(
+            err_with.contains("invalid tls.mode"),
+            "garbage tls.mode with --no-tls should still fail, got: {err_with}"
+        );
+    }
+
+    #[test]
+    fn psk_mode_rejects_placeholder_key_unless_no_tls() {
+        let toml = format!(
+            "{MIN_CONFIG}\n[tls]\nmode = \"psk\"\npsk_identity = \"mnccd-cluster\"\npsk_key = \"replace-with-a-long-random-secret\"\n"
+        );
+        let raw: RawConfig = toml::from_str(&toml).unwrap();
+        let err = super::config_from_raw(raw, false).unwrap_err();
+        assert!(
+            err.contains("sample placeholder"),
+            "expected placeholder rejection, got: {err}"
+        );
+
+        let raw: RawConfig = toml::from_str(&toml).unwrap();
+        let cfg = super::config_from_raw(raw, true).expect("--no-tls should skip PSK checks");
+        assert_eq!(cfg.grpc_tls_mode, super::GrpcTlsMode::Plain);
+        assert!(cfg.psk_tls.is_none());
+    }
+
+    #[test]
+    fn psk_mode_rejects_empty_credentials_unless_no_tls() {
+        let toml = format!("{MIN_CONFIG}\n[tls]\nmode = \"psk\"\n");
+        let raw: RawConfig = toml::from_str(&toml).unwrap();
+        assert!(super::config_from_raw(raw, false).is_err());
+
+        let raw: RawConfig = toml::from_str(&toml).unwrap();
+        let cfg = super::config_from_raw(raw, true).expect("--no-tls should skip empty PSK");
+        assert!(cfg.psk_tls.is_none());
     }
 }

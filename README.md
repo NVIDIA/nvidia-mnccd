@@ -74,7 +74,7 @@ Set `[tls].mode` in `mnccd_config.toml` (all nodes must use the same mode):
 | Mutual TLS | `mtls` | rustls with PEM certificates. Requires operator-supplied files under `tls/` on every node (see below). |
 | Plaintext | `none` | Unencrypted gRPC. Usually selected with `--no-tls` on the CLI (overrides config). |
 
-If the `[tls]` section is omitted, MNCCD defaults to **`psk`**, but **`psk_identity` and `psk_key` are required** and must be set explicitly (startup fails if either is missing or empty).
+If the `[tls]` section is omitted, MNCCD defaults to **`psk`**, but **`psk_identity` and `psk_key` are required** and must be set explicitly (startup fails if either is missing or empty, unless `--no-tls` is set).
 
 **TLS-PSK (`psk`, default)**
 
@@ -97,7 +97,7 @@ psk_identity = "mnccd-cluster"
 psk_key = "replace-with-a-long-random-secret"
 ```
 
-Provision the same `psk_identity` and `psk_key` on every node (ConfigMap, Secret, or baked into `mnccd_config.toml`). The sample placeholder key in the shipped `mnccd_config.toml` (`replace-with-a-long-random-secret`) is **rejected at startup**—replace it before running.
+Provision the same `psk_identity` and `psk_key` on every node (ConfigMap, Secret, or baked into `mnccd_config.toml`). The sample placeholder key in the shipped `mnccd_config.toml` (`replace-with-a-long-random-secret`) is **rejected at startup** unless `--no-tls` is set—replace it before running with TLS-PSK.
 
 **Mutual TLS (`mtls`)**
 
@@ -161,7 +161,7 @@ Run `nvidia-mnccd --help` (or `-h`) for usage, including where `mnccd_config.tom
 | Argument | Required | Description |
 | --- | --- | --- |
 | `--skip-nvle` | No | When set, the leader node **does not** call `setup_nvle_on_all_gpus()` after peer echo checks. Omit for the normal path where the leader configures NVLE on GPUs across the cluster. |
-| `--no-tls` | No | Force plaintext gRPC (`[tls].mode = "none"`), regardless of config. Must be used on **all** nodes together, or on **none** of them. Strictly for development platforms only; not recommended on production. |
+| `--no-tls` | No | Force plaintext gRPC, regardless of `[tls]`. Skips PSK credential checks. Must be used on **all** nodes together, or on **none** of them. Strictly for development platforms only; not recommended on production. |
 | `--daemonize` | No | Fork into the background and redirect stdout/stderr to `/tmp/nvidia-mnccd.out` and `/tmp/nvidia-mnccd.err`. For manual runs without systemd. **Do not** use with the systemd unit (see below). |
 | `--log-level <LEVEL>` | No | Base log verbosity: `error`, `warn`, `info` (default), `debug`, or `trace`. Overridden by the `RUST_LOG` environment variable when set. See [Logging](#logging). |
 
